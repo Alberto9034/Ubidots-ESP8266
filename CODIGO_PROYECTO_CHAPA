@@ -1,0 +1,272 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <MFRC522.h>
+#include <Ubidots.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SS_PIN D8
+#define RST_PIN D0
+#define rele D3
+#define alarma D4
+#define usuarios 1
+
+
+// Configuración del OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_I2C_ADDRESS 0x3C // Dirección I2C del display (actualízala si es necesario)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// CONEXIÓN CON UBIDOTS
+#define dispositivo "proj-esp8266"
+#define UBIDOTS_TOKEN "BBUS-Ebh56ZwdYeIgAG4UFARD8ZnSifCmBI"
+
+// CONEXIÓN A INTERNET 
+const char* WIFI_SSID = "ITT_D1";
+const char* WIFI_PASS = "50aniversario";
+
+// VARIABLES UBIDOTS
+#define LAB_INFO "ESTADO"
+#define MANUAL_CONTROL "RELE_CONTROL"
+#define PASSWORD_CONTROL "PASSWORD_CONTROL"
+#define ALARMA_INFO "ALARMA_INDICADOR"
+
+// Ubidots instance
+Ubidots ubidots(UBIDOTS_TOKEN);
+
+// RFID instance
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+MFRC522::MIFARE_Key key;
+
+// NUIDs permitidos (predefinidos para n usuarios)
+byte authorizedUsers[usuarios][4] = {
+  {0xEA, 0x98, 0x3D, 0xD9} // Usuario 1
+};
+
+// Nombres asociados a los NUIDs autorizados
+const char* nombres[usuarios] = {"Admin"}; 
+
+// Variable para almacenar el NUID actual leído
+byte nuidPICC[4];
+
+// Función para escanear dispositivos I2C
+void scanI2C() {
+  Serial.println(F("Escaneando dispositivos I2C..."));
+  byte count = 0;
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(F("Dispositivo I2C encontrado en dirección 0x"));
+      Serial.println(address, HEX);
+      count++;
+      delay(1);
+    }
+  }
+  if (count == 0) Serial.println(F("No se encontraron dispositivos I2C."));
+  else Serial.println(F("Escaneo I2C completado."));
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  scanI2C(); // Escaneo I2C para confirmar la dirección del OLED
+  digitalWrite(rele, HIGH);
+  // Inicializar el display OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) { // Intentar inicializar con la dirección especificada
+    Serial.println(F("No se pudo inicializar el display OLED."));
+    while (true); // Detener el programa si el OLED no se inicia
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Iniciando...");
+  display.display();
+
+  SPI.begin(); // Inicializar el bus SPI
+  rfid.PCD_Init(); // Inicializar el MFRC522
+  Serial.println(F("Sistema de control de acceso RFID."));
+
+  // Conexión wifi
+  ubidots.wifiConnect(WIFI_SSID, WIFI_PASS);
+  ubidots.setDebug(true);  
+
+  pinMode(rele, OUTPUT);
+  pinMode(alarma, OUTPUT);  
+
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF;
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Sistema listo.");
+  display.display();
+  delay(2000);
+}
+
+
+void loop() {
+  // Comprobar control manual desde Ubidots
+  checkManualControl();
+
+  // Comprobar acceso mediante contraseña desde Ubidots
+  checkPasswordAccess();
+
+  // Verifica si hay una nueva tarjeta presente
+  if (!rfid.PICC_IsNewCardPresent()) return;
+
+  // Verifica si se puede leer la tarjeta
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  Serial.print(F("PICC type: "));
+  MFRC522::PICC_Type piccType = rfid.PICC_GetType(rfid.uid.sak);
+  Serial.println(rfid.PICC_GetTypeName(piccType));
+
+  // Verifica si el tipo de tarjeta es MIFARE Classic
+  if (piccType != MFRC522::PICC_TYPE_MIFARE_MINI &&
+      piccType != MFRC522::PICC_TYPE_MIFARE_1K &&
+      piccType != MFRC522::PICC_TYPE_MIFARE_4K) {
+    Serial.println(F("La tarjeta no es del tipo MIFARE Classic."));
+    return;
+  }
+
+  Serial.println(F("Nueva tarjeta detectada."));
+  Serial.print(F("NUID en Hex: "));
+  printHex(rfid.uid.uidByte, rfid.uid.size);
+  Serial.println();
+
+  // Copiar el NUID leído
+  for (byte i = 0; i < 4; i++) {
+    nuidPICC[i] = rfid.uid.uidByte[i];
+  }
+
+  // Verificar si el NUID coincide con algún usuario autorizado
+  int userIndex = getAuthorizedUserIndex(nuidPICC);
+  if (userIndex != -1) {
+    Serial.println(F("Acceso permitido."));
+    Serial.print(F("Bienvenido "));
+    Serial.println(nombres[userIndex]); // Imprime el nombre del usuario
+
+    displayMessage("Acceso permitido", "Bienvenido " + String(nombres[userIndex]));
+
+
+    // Activar relevador
+    digitalWrite(rele, LOW);  
+    // Enviar estado a Ubidots
+    ubidots.add(LAB_INFO, 1, NULL); // 1: acceso permitido
+    ubidots.send(dispositivo);
+    delay(1000);
+    digitalWrite(rele, HIGH); 
+    ubidots.add(LAB_INFO, 0, NULL); //
+    ubidots.send(dispositivo);    
+  } 
+  else {
+    Serial.println(F("Acceso denegado."));
+    triggerAlarm();
+    displayMessage("Acceso denegado", "Usuario desconocido");
+
+  }
+
+  // Detener comunicación con la tarjeta
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void checkManualControl() {
+  float controlValue = ubidots.get(dispositivo, MANUAL_CONTROL);
+  if (controlValue == 1.0) {
+    digitalWrite(rele, LOW);
+    Serial.println(F("Control manual activado desde Ubidots. Activando relevador."));
+    displayMessage("Control manual", "Activando relevador.");
+    delay(1000);
+    digitalWrite(rele, HIGH);
+    ubidots.add(MANUAL_CONTROL, 0, NULL);
+    ubidots.send(dispositivo);
+  }
+}
+
+void checkPasswordAccess() {
+  float receivedValue = ubidots.get(dispositivo, PASSWORD_CONTROL);
+
+  if (receivedValue == 12) { // Contraseña válida
+
+    digitalWrite(rele, LOW);
+
+    Serial.println(F("Contraseña válida desde Ubidots. Activando relevador."));
+    displayMessage("Acceso permitido", "Codigo correcto.");
+
+
+    ubidots.add(LAB_INFO, 1, NULL); // 1: acceso permitido
+    ubidots.send(dispositivo);
+
+
+    delay(1000);
+    
+    digitalWrite(rele, HIGH);
+
+    ubidots.add(LAB_INFO, 0, NULL); //
+    ubidots.send(dispositivo);  
+
+    ubidots.add(PASSWORD_CONTROL, 0, NULL);
+    ubidots.send(dispositivo);
+  } else if (receivedValue != 0) { // Intento inválido
+    Serial.println(F("Contraseña incorrecta desde Ubidots."));
+    displayMessage("Acceso denegado", "Codigo incorrecto.");
+    triggerAlarm();
+    ubidots.add(PASSWORD_CONTROL, 0, NULL);
+    ubidots.send(dispositivo);
+  }
+}
+
+void triggerAlarm() {
+  digitalWrite(alarma, HIGH);
+  Serial.println(F("Alarma activada."));
+  ubidots.add(ALARMA_INFO, 1, NULL);
+  ubidots.send(dispositivo);
+  delay(1000);
+  digitalWrite(alarma, LOW);
+  ubidots.add(ALARMA_INFO, 0, NULL);
+  ubidots.send(dispositivo);
+}
+
+int getAuthorizedUserIndex(byte *nuid) {
+  for (byte user = 0; user < usuarios; user++) {
+    bool authorized = true;
+    for (byte i = 0; i < 4; i++) {
+      if (authorizedUsers[user][i] != nuid[i]) {
+        authorized = false;
+        break;
+      }
+    }
+    if (authorized) return user;
+  }
+  return -1;
+}
+
+void printHex(byte *buffer, byte bufferSize) {
+  for (byte i = 0; i < bufferSize; i++) {
+    Serial.print(buffer[i] < 0x10 ? " 0" : " ");
+    Serial.print(buffer[i], HEX);
+  }
+}
+
+void displayMessage(String line1, String line2) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(line1);
+  display.println(line2);
+  display.display();
+
+  delay(3000); // Mostrar el mensaje actual durante 2 segundos
+
+  // Volver a la pantalla principal
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Sistema listo.");
+  display.display();
+}
